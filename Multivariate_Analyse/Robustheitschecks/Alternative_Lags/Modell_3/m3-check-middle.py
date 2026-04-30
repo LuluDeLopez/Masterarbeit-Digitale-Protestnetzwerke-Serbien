@@ -22,18 +22,16 @@ df["Einwohner"] = df["Einwohner"].fillna(0)
 df["Wahl Opposition"] = df["Wahl Opposition"].fillna(0)
 
 # =========================
-# 2. LAGS ERSTELLEN FÜR MIDDLE
+# 2. LAGS ERSTELLEN
+# AV: rohe Zählwerte (_lag1, _lag4 für verzögerte AVs in Step1)
+# Prädiktoren: log-transformierte Lags (_log_lag2, _log_lag4)
 # =========================
-lag_vars = ["Protests","Posts","participants","Active_Accounts"]
-for var in lag_vars:
-    # alle benötigten Lags erstellen
+count_vars = ["Protests", "Posts", "participants", "Active_Accounts"]
+
+for var in count_vars:
     df[f"{var}_lag1"] = df.groupby("Location")[var].shift(1)
     df[f"{var}_lag2"] = df.groupby("Location")[var].shift(2)
     df[f"{var}_lag4"] = df.groupby("Location")[var].shift(4)
-
-# Log-Transformationen
-for var in lag_vars:
-    df[f"{var}_log"] = np.log1p(df[var])
     df[f"{var}_log_lag1"] = np.log1p(df[f"{var}_lag1"])
     df[f"{var}_log_lag2"] = np.log1p(df[f"{var}_lag2"])
     df[f"{var}_log_lag4"] = np.log1p(df[f"{var}_lag4"])
@@ -46,25 +44,23 @@ df = df.replace([np.inf, -np.inf], np.nan).dropna()
 df["week"] = df["Date"].dt.to_period("W").dt.start_time
 df["month"] = df["Date"].dt.to_period("M").dt.start_time
 
-df_week = df.groupby(["Location","week"]).agg({
-    "Posts":"sum","Active_Accounts":"sum","Protests":"sum","participants":"sum",
-    "Einwohner":"first","Wahl Opposition":"first"
+df_week = df.groupby(["Location", "week"]).agg({
+    "Posts": "sum", "Active_Accounts": "sum", "Protests": "sum", "participants": "sum",
+    "Einwohner": "first", "Wahl Opposition": "first"
 }).reset_index()
 
-df_month = df.groupby(["Location","month"]).agg({
-    "Posts":"sum","Active_Accounts":"sum","Protests":"sum","participants":"sum",
-    "Einwohner":"first","Wahl Opposition":"first"
+df_month = df.groupby(["Location", "month"]).agg({
+    "Posts": "sum", "Active_Accounts": "sum", "Protests": "sum", "participants": "sum",
+    "Einwohner": "first", "Wahl Opposition": "first"
 }).reset_index()
 
 agg_dfs = {"Daily": df, "Weekly": df_week, "Monthly": df_month}
 
-# Lags für aggregierte Daten ebenfalls erstellen
 for name, df_agg in agg_dfs.items():
-    for var in lag_vars:
+    for var in count_vars:
         df_agg[f"{var}_lag1"] = df_agg.groupby("Location")[var].shift(1)
         df_agg[f"{var}_lag2"] = df_agg.groupby("Location")[var].shift(2)
         df_agg[f"{var}_lag4"] = df_agg.groupby("Location")[var].shift(4)
-        df_agg[f"{var}_log"] = np.log1p(df_agg[var])
         df_agg[f"{var}_log_lag1"] = np.log1p(df_agg[f"{var}_lag1"])
         df_agg[f"{var}_log_lag2"] = np.log1p(df_agg[f"{var}_lag2"])
         df_agg[f"{var}_log_lag4"] = np.log1p(df_agg[f"{var}_lag4"])
@@ -73,14 +69,53 @@ agg_dfs["Daily"], agg_dfs["Weekly"], agg_dfs["Monthly"] = df, df_week, df_month
 
 # =========================
 # 4. SEQUENTIELLE RÜCKKOPPLUNG MIDDLE
+#
+# AV:          rohe Zählwerte (NegBin erwartet nicht-negative Ganzzahlen)
+# Prädiktoren: log-transformierte Lags
+# Interpretation: exp(beta) - 1 = prozentualer Effekt auf den erwarteten Zählwert
 # =========================
 def sequential_feedback_middle(df, step1_dv, step1_iv, step2_dv, step2_iv,
-                               control_vars=None, time_var=None, label=""):
+                                control_vars=None, time_var=None, label=""):
     if control_vars is None:
         control_vars = []
 
-    formula1 = f"{step1_dv} ~ {step1_iv} + " + " + ".join(control_vars)
-    formula2 = f"{step2_dv} ~ {step2_iv} + " + " + ".join(control_vars)
+    # Remove IVs from controls to avoid collinearity/silent parameter drop
+    controls1 = [c for c in control_vars if c != step1_iv]
+    controls2 = [c for c in control_vars if c != step2_iv]
+
+    cols1 = [step1_dv, step1_iv] + controls1 + (["Location", time_var] if time_var else ["Location"])
+    cols2 = [step2_dv, step2_iv] + controls2 + (["Location", time_var] if time_var else ["Location"])
+
+    df1 = df[[c for c in cols1 if c in df.columns]].copy()
+    df2 = df[[c for c in cols2 if c in df.columns]].copy()
+
+    # Replace inf, then drop NaN
+    df1 = df1.replace([np.inf, -np.inf], np.nan).dropna()
+    df2 = df2.replace([np.inf, -np.inf], np.nan).dropna()
+
+    # DV must be non-negative integer-like — drop any rows where DV is invalid
+    df1 = df1[df1[step1_dv] >= 0]
+    df2 = df2[df2[step2_dv] >= 0]
+
+    # Extra safety: ensure DV contains no NaN/inf after filtering
+    df1 = df1[np.isfinite(df1[step1_dv])]
+    df2 = df2[np.isfinite(df2[step2_dv])]
+
+    # Round DV to nearest integer (NegBin requires count data)
+    df1[step1_dv] = df1[step1_dv].round().astype(int)
+    df2[step2_dv] = df2[step2_dv].round().astype(int)
+
+    if len(df1) < 10 or len(df2) < 10:
+        print(f"⚠️  Zu wenige Beobachtungen für {label} – übersprungen.")
+        return {
+            "label": label,
+            "step1_effect": np.nan, "step1_ci_low": np.nan, "step1_ci_high": np.nan,
+            "step2_effect": np.nan, "step2_ci_low": np.nan, "step2_ci_high": np.nan,
+            "indirect_effect": np.nan, "indirect_ci_low": np.nan, "indirect_ci_high": np.nan
+        }
+
+    formula1 = f"{step1_dv} ~ {step1_iv} + " + " + ".join(controls1)
+    formula2 = f"{step2_dv} ~ {step2_iv} + " + " + ".join(controls2)
 
     if time_var:
         formula1 += f" + C(Location) + C({time_var})"
@@ -89,22 +124,42 @@ def sequential_feedback_middle(df, step1_dv, step1_iv, step2_dv, step2_iv,
         formula1 += " + C(Location)"
         formula2 += " + C(Location)"
 
-    step1_model = smf.glm(formula=formula1, data=df, family=sm.families.NegativeBinomial()).fit()
-    step2_model = smf.glm(formula=formula2, data=df, family=sm.families.NegativeBinomial()).fit()
+    try:
+        step1_model = smf.glm(formula=formula1, data=df1, family=sm.families.NegativeBinomial()).fit()
+        step2_model = smf.glm(formula=formula2, data=df2, family=sm.families.NegativeBinomial()).fit()
+    except Exception as e:
+        print(f"⚠️  Modell-Fehler bei {label}: {e}")
+        return {
+            "label": label,
+            "step1_effect": np.nan, "step1_ci_low": np.nan, "step1_ci_high": np.nan,
+            "step2_effect": np.nan, "step2_ci_low": np.nan, "step2_ci_high": np.nan,
+            "indirect_effect": np.nan, "indirect_ci_low": np.nan, "indirect_ci_high": np.nan
+        }
 
+    # --- rest of function unchanged from here ---
     step1_effect = (np.exp(step1_model.params[step1_iv]) - 1) * 100
     step2_effect = (np.exp(step2_model.params[step2_iv]) - 1) * 100
     indirect_effect = (np.exp(step1_model.params[step1_iv] * step2_model.params[step2_iv]) - 1) * 100
 
     se1, se2 = step1_model.bse[step1_iv], step2_model.bse[step2_iv]
     z = norm.ppf(0.975)
-    step1_ci = ((np.exp(step1_model.params[step1_iv] - z*se1) - 1)*100,
-                (np.exp(step1_model.params[step1_iv] + z*se1) - 1)*100)
-    step2_ci = ((np.exp(step2_model.params[step2_iv] - z*se2) - 1)*100,
-                (np.exp(step2_model.params[step2_iv] + z*se2) - 1)*100)
-    indirect_se = np.sqrt((step2_model.params[step2_iv]**2 * se1**2) + (step1_model.params[step1_iv]**2 * se2**2))
-    indirect_ci = ((np.exp(step1_model.params[step1_iv]*step2_model.params[step2_iv] - z*indirect_se) - 1)*100,
-                   (np.exp(step1_model.params[step1_iv]*step2_model.params[step2_iv] + z*indirect_se) - 1)*100)
+
+    step1_ci = (
+        (np.exp(step1_model.params[step1_iv] - z * se1) - 1) * 100,
+        (np.exp(step1_model.params[step1_iv] + z * se1) - 1) * 100
+    )
+    step2_ci = (
+        (np.exp(step2_model.params[step2_iv] - z * se2) - 1) * 100,
+        (np.exp(step2_model.params[step2_iv] + z * se2) - 1) * 100
+    )
+    indirect_se = np.sqrt(
+        (step2_model.params[step2_iv] ** 2 * se1 ** 2) +
+        (step1_model.params[step1_iv] ** 2 * se2 ** 2)
+    )
+    indirect_ci = (
+        (np.exp(step1_model.params[step1_iv] * step2_model.params[step2_iv] - z * indirect_se) - 1) * 100,
+        (np.exp(step1_model.params[step1_iv] * step2_model.params[step2_iv] + z * indirect_se) - 1) * 100
+    )
 
     return {
         "label": label,
@@ -120,19 +175,55 @@ def sequential_feedback_middle(df, step1_dv, step1_iv, step2_dv, step2_iv,
     }
 
 # =========================
-# 5. RUN MIDDLE MODELS
+# 5. HYPOTHESEN
+#
+# step1_dv / step2_dv: rohe Zählwerte (AV für NegBin)
+# step1_iv / step2_iv: log-transformierte Lags (Prädiktoren)
 # =========================
-controls = ["Protests_log_lag2", "participants_log_lag2", "Posts_log_lag2", "Active_Accounts_log_lag2"]
-
-h3_middle_hypotheses = [
-    {"label":"Middle-H3a1: Protests → Posts → Protests", "step1_dv":"Posts_log_lag4", "step1_iv":"Protests_log_lag2",
-     "step2_dv":"Protests_log", "step2_iv":"Posts_log_lag4"},
-    {"label":"Middle-H3a2: Protests → ActiveAccounts → Protests", "step1_dv":"Active_Accounts_log_lag4", "step1_iv":"Protests_log_lag2",
-     "step2_dv":"Protests_log", "step2_iv":"Active_Accounts_log_lag4"},
-    {"label":"Middle-H3a3: Participants → Posts → Participants", "step1_dv":"Posts_log_lag4", "step1_iv":"participants_log_lag2",
-     "step2_dv":"participants_log", "step2_iv":"Posts_log_lag4"},
+controls = [
+    "Protests_log_lag2", "participants_log_lag2",
+    "Posts_log_lag2", "Active_Accounts_log_lag2"
 ]
 
+h3a_middle_hypotheses = [
+    {"label": "Middle-H3a1: Protests → Posts → Protests",
+     "step1_dv": "Posts_lag4",
+     "step1_iv": "Protests_log_lag2",
+     "step2_dv": "Protests",
+     "step2_iv": "Posts_log_lag4"},
+    {"label": "Middle-H3a2: Protests → ActiveAccounts → Protests",
+     "step1_dv": "Active_Accounts_lag4",
+     "step1_iv": "Protests_log_lag2",
+     "step2_dv": "Protests",
+     "step2_iv": "Active_Accounts_log_lag4"},
+    {"label": "Middle-H3a3: Participants → Posts → Participants",
+     "step1_dv": "Posts_lag4",
+     "step1_iv": "participants_log_lag2",
+     "step2_dv": "participants",
+     "step2_iv": "Posts_log_lag4"},
+]
+
+h3b_middle_hypotheses = [
+    {"label": "Middle-H3b1: Posts → Protests → Posts",
+     "step1_dv": "Protests_lag4",
+     "step1_iv": "Posts_log_lag2",
+     "step2_dv": "Posts",
+     "step2_iv": "Protests_log_lag4"},
+    {"label": "Middle-H3b2: ActiveAccounts → Protests → ActiveAccounts",
+     "step1_dv": "Protests_lag4",
+     "step1_iv": "Active_Accounts_log_lag2",
+     "step2_dv": "Active_Accounts",
+     "step2_iv": "Protests_log_lag4"},
+    {"label": "Middle-H3b3: Posts → Participants → Posts",
+     "step1_dv": "participants_lag4",
+     "step1_iv": "Posts_log_lag2",
+     "step2_dv": "Posts",
+     "step2_iv": "participants_log_lag4"},
+]
+
+# =========================
+# 6. MODELLE LAUFEN LASSEN
+# =========================
 def run_middle_all_levels():
     results = []
     for level, df_level in agg_dfs.items():
@@ -144,7 +235,7 @@ def run_middle_all_levels():
             df_level["month_cat"] = df_level["month"].dt.strftime("%Y-%m")
             time_var = "month_cat"
 
-        for hyp in h3_middle_hypotheses:
+        for hyp in h3a_middle_hypotheses + h3b_middle_hypotheses:
             res = sequential_feedback_middle(
                 df=df_level,
                 step1_dv=hyp["step1_dv"],
@@ -158,10 +249,11 @@ def run_middle_all_levels():
             results.append(res)
     return pd.DataFrame(results)
 
+# =========================
+# 7. ERGEBNISSE SPEICHERN
+# =========================
 results_middle_df = run_middle_all_levels()
+print(results_middle_df.round(1))
 
-# =========================
-# 6. SPEICHERN
-# =========================
 results_middle_df.to_excel("Ergebnisse_H3_middle.xlsx", index=False)
 print("Middle-Ergebnisse in 'Ergebnisse_H3_middle.xlsx' gespeichert.")
